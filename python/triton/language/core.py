@@ -3666,6 +3666,8 @@ class range(base_value):
     :param arg2: the end value.
     :param step: the step value. A negative step is supported only when it is a
         :code:`constexpr`; a runtime (non-:code:`constexpr`) step must be positive.
+        An unsigned range must have fewer than :code:`2**63` iterations, which
+        :code:`TRITON_DEBUG` checks.
     :param num_stages: pipeline the loop into this many stages (so there are
         :code:`num_stages` iterations of the loop in flight at once).
 

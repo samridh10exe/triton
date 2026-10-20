@@ -6764,6 +6764,11 @@ def test_for_iv(lo, hi, iv, device):
     pytest.param(("int32", 0), ("int32", 5), ("bool", True), id="bool_step"),
     pytest.param(("int8", -5), ("int32", 5), ("int32", 1), id="signed_control"),
     pytest.param(("uint32", 0), ("uint8", 200), ("int32", 1), id="unsigned_control"),
+    pytest.param(("uint32", 2**31 - 2), ("uint32", 2**31 + 2), ("int32", 1), id="uint32_across_sign_bit"),
+    pytest.param(("uint32", 2**31 + 2), ("uint32", 5), ("int32", 1), id="uint32_empty"),
+    pytest.param(("uint64", 2**63 - 2), ("uint64", 2**63 + 2), ("int32", 1), id="uint64_across_sign_bit"),
+    pytest.param(("uint32", 2**32 - 3), ("uint32", 2**32 - 1), ("int32", 4), id="uint32_step_past_max"),
+    pytest.param(("int64", -2), ("uint64", 2**64 - 1), ("int64", 2**63 - 1), id="distance_above_uint64_max"),
 ])
 def test_for_loop_operand_signedness(lower, upper, step, use_tl_range, device):
 
@@ -6789,6 +6794,28 @@ def test_for_loop_operand_signedness(lower, upper, step, use_tl_range, device):
     out = torch.empty(2, dtype=torch.int64, device=device)
     kernel[(1, )](*operands, out, use_tl_range)
     expected = range(lower[1], upper[1], step[1])
+    # The kernel sums in int64, which wraps for uint64 induction values.
+    expected_total = (sum(expected) + 2**63) % 2**64 - 2**63
+    assert out.tolist() == [len(expected), expected_total]
+
+
+@pytest.mark.parametrize("lower, upper, step", [(5, -1, -1), (2**31 + 1, 2**31 - 3, -2)])
+def test_for_loop_unsigned_negative_step(lower, upper, step, device):
+
+    @triton.jit
+    def kernel(Lower, Out, UPPER: tl.constexpr, STEP: tl.constexpr):
+        count = tl.full((), 0, tl.int64)
+        total = tl.full((), 0, tl.int64)
+        for i in range(tl.load(Lower), UPPER, STEP):
+            count += 1
+            total += i.to(tl.int64)
+        tl.store(Out, count)
+        tl.store(Out + 1, total)
+
+    lower_t = to_triton(np.array([lower], dtype="uint32"), device=device)
+    out = torch.empty(2, dtype=torch.int64, device=device)
+    kernel[(1, )](lower_t, out, upper, step)
+    expected = range(lower, upper, step)
     assert out.tolist() == [len(expected), sum(expected)]
 
 

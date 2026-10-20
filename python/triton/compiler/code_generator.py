@@ -1285,6 +1285,51 @@ class CodeGenerator(ast.NodeVisitor):
     def visit_ExtSlice(self, node):
         return [self.visit(dim) for dim in node.dims]
 
+    def _unsigned_range_trip_count(self, sources, operands, iv_type):
+        """Returns the trip count of an unsigned `range` as i64, and its bounds and step in i64.
+
+        Ranges of 2**63 or more iterations are unsupported: the count saturates, and asserts under debug.
+        """
+        builder = self.builder
+        zero = builder.get_int64(0)
+        one = builder.get_int64(1)
+        if iv_type.int_bitwidth < 64:
+            i64 = builder.get_int64_ty()
+            lb, ub, step = (builder.create_int_cast(x.handle, i64, x.dtype.is_int_signed()) for x in sources)
+            span = builder.create_sub(builder.create_sub(ub, lb), one)
+            count = builder.create_add(builder.create_sdiv(span, step), one)
+            return builder.create_select(builder.create_icmpSLT(lb, ub), count, zero), lb, ub, step
+        lb, ub, step = operands
+        # Operands narrower than 64 bits were extended exactly, so they compare as signed.
+        lb_signed, ub_signed = (x.dtype.is_int_signed() or x.dtype.int_bitwidth < 64 for x in sources[:2])
+        all_ones = builder.get_int64(-1)
+        span = builder.create_sub(builder.create_sub(ub, lb), one)
+        quotient = builder.create_udiv(span, step)
+        if lb_signed == ub_signed:
+            non_empty = (builder.create_icmpSLT if lb_signed else builder.create_icmpULT)(lb, ub)
+        elif ub_signed:
+            non_empty = builder.create_and(builder.create_icmpSGE(ub, zero), builder.create_icmpULT(lb, ub))
+        else:
+            lb_negative = builder.create_icmpSLT(lb, zero)
+            non_empty = builder.create_or(lb_negative, builder.create_icmpULT(lb, ub))
+            # ub - lb can exceed 2**64 - 1 for a negative lb, so divide ub and -lb - 1 separately.
+            not_lb = builder.create_xor(lb, all_ones)
+            ub_quotient = builder.create_udiv(ub, step)
+            carry = builder.create_icmpUGE(builder.create_urem(ub, step),
+                                           builder.create_sub(step, builder.create_urem(not_lb, step)))
+            split = builder.create_add(
+                ub_quotient,
+                builder.create_add(builder.create_udiv(not_lb, step), builder.create_select(carry, one, zero)))
+            split = builder.create_select(builder.create_icmpULT(split, ub_quotient), all_ones, split)
+            quotient = builder.create_select(lb_negative, split, quotient)
+        max_count = builder.get_int64(2**63 - 1)
+        fits = builder.create_icmpULT(quotient, max_count)
+        if builder.options.debug:
+            builder.create_assert(builder.create_select(non_empty, fits, builder.get_int1(True)),
+                                  "range() with 2**63 or more iterations is not supported")
+        count = builder.create_select(fits, builder.create_add(quotient, one), max_count)
+        return builder.create_select(non_empty, count, zero), lb, ub, step
+
     def visit_For(self, node):
         IteratorClass = self.visit(node.iter.func)
         iter_args = [self.visit(arg) for arg in node.iter.args]
@@ -1349,10 +1394,15 @@ class CodeGenerator(ast.NodeVisitor):
         iv_type = self.semantic.integer_promote_impl(lb.dtype, ub.dtype)
         iv_type = self.semantic.integer_promote_impl(iv_type, step.dtype)
         iv_ir_type = iv_type.to_ir(self.builder)
+        sources = (lb, ub, step)
         # Preserve each operand's signedness when widening to the induction type.
         lb = self.builder.create_int_cast(lb.handle, iv_ir_type, lb.dtype.is_int_signed())
         ub = self.builder.create_int_cast(ub.handle, iv_ir_type, ub.dtype.is_int_signed())
         step = self.builder.create_int_cast(step.handle, iv_ir_type, step.dtype.is_int_signed())
+        # scf.for compares as signed and must not overflow, so unsigned ranges run over an i64 trip count.
+        unsigned_range = None
+        if iv_type.is_int_unsigned():
+            unsigned_range = self._unsigned_range_trip_count(sources, (lb, ub, step), iv_type)
         # Create placeholder for the loop induction variable
         iv_placeholder = self.builder.create_poison(iv_ir_type)
         self.set_value(node.target.id, language.core.tensor(iv_placeholder, iv_type))
@@ -1365,7 +1415,11 @@ class CodeGenerator(ast.NodeVisitor):
 
             # create ForOp
             self._set_insertion_point_and_loc(ip, last_loc)
-            for_op = self.builder.create_for_op(lb, ub, step, init_handles)
+            if unsigned_range is None:
+                for_op = self.builder.create_for_op(lb, ub, step, init_handles)
+            else:
+                for_op = self.builder.create_for_op(self.builder.get_int64(0), unsigned_range[0],
+                                                    self.builder.get_int64(1), init_handles)
             if _unwrap_if_constexpr(num_stages) is not None:
                 for_op.set_attr("tt.num_stages", self.builder.get_int32_attr(num_stages))
             if _unwrap_if_constexpr(loop_unroll_factor) is not None:
@@ -1403,7 +1457,15 @@ class CodeGenerator(ast.NodeVisitor):
             # update induction variable with actual value, and replace all uses
             self.builder.set_insertion_point_to_start(for_op_body)
             iv = for_op.get_induction_var()
-            if negative_step:
+            if unsigned_range is not None:
+                _, wide_lb, wide_ub, wide_step = unsigned_range
+                offset = self.builder.create_mul(iv, wide_step)
+                if negative_step:
+                    iv = self.builder.create_sub(wide_ub, offset)
+                else:
+                    iv = self.builder.create_add(wide_lb, offset)
+                iv = self.builder.create_int_cast(iv, iv_ir_type, False)
+            elif negative_step:
                 iv = self.builder.create_sub(ub, iv)
                 iv = self.builder.create_add(iv, lb)
             iv_placeholder.replace_all_uses_with(iv)

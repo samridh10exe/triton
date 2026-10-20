@@ -7,6 +7,7 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton._filecheck import filecheck_test, run_filecheck_test, run_parser
+from triton._C.libtriton import ir, passes
 from triton.compiler.code_generator import CodeGenerator
 from triton.runtime.jit import MockTensor
 from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
@@ -1377,6 +1378,55 @@ def test_for_loop_operand_extension(jit, operand, src_dtype, iv_dtype):
     assert len(extensions) == 1
     expected_op = "arith.extsi" if src_dtype in (tl.int8, tl.int16) else "arith.extui"
     assert expected_op in extensions[0]
+
+
+@pytest.mark.parametrize("jit", [triton.jit, gluon.jit])
+@pytest.mark.parametrize("iv_dtype", [tl.int32, tl.uint32, tl.int64, tl.uint64], ids=str)
+def test_for_loop_unsigned_range_counts_iterations(jit, iv_dtype):
+    language = tl if jit is triton.jit else gl
+
+    @jit
+    def kernel(X, IV_DTYPE: tl.constexpr):
+        lower = language.load(X).to(IV_DTYPE)
+        upper = language.load(X + 1).to(IV_DTYPE)
+        for i in range(lower, upper):
+            language.store(X, i)
+
+    module = run_parser(kernel, args=(MockTensor(tl.int64), iv_dtype))
+    loops = [line for line in module.str_nodebug().splitlines() if "scf.for" in line]
+    assert len(loops) == 1
+    assert "scf.for unsigned" not in loops[0]
+    expected_type = "i64" if iv_dtype.is_int_unsigned() else f"i{iv_dtype.int_bitwidth}"
+    assert loops[0].rstrip().endswith(f": {expected_type} {{")
+
+
+@pytest.mark.parametrize("debug", [False, True])
+@pytest.mark.parametrize("iv_dtype, lower, upper, expected_upper", [
+    (tl.uint64, 0, 2**63 - 1, 2**63 - 1),
+    (tl.uint64, 0, 2**63, 2**63 - 1),
+    (tl.uint64, 5, 3, None),
+    (tl.uint32, 0, 2**32 - 1, 2**32 - 1),
+], ids=str)
+def test_for_loop_unsigned_range_iteration_limit(debug, iv_dtype, lower, upper, expected_upper):
+
+    @triton.jit
+    def kernel(X, LOWER: tl.constexpr, UPPER: tl.constexpr, IV_DTYPE: tl.constexpr):
+        for i in range(tl.full((), LOWER, IV_DTYPE), tl.full((), UPPER, IV_DTYPE)):
+            tl.store(X, i)
+
+    module = run_parser(kernel, args=(MockTensor(tl.uint64), lower, upper, iv_dtype), kwargs={"debug": debug})
+    pm = ir.pass_manager(module.context)
+    passes.common.add_sccp(pm)
+    passes.common.add_canonicalizer(pm)
+    pm.run(module, "test_for_loop_unsigned_range_iteration_limit")
+    text = module.str_nodebug()
+    loops = [line for line in text.splitlines() if "scf.for" in line]
+    if expected_upper is None:
+        assert not loops
+    else:
+        assert len(loops) == 1 and f"to %c{expected_upper}_i64 " in loops[0]
+    # Only 64-bit counts can reach the limit.
+    assert ("tt.assert" in text) == (debug and iv_dtype.int_bitwidth == 64)
 
 
 @pytest.mark.interpreter

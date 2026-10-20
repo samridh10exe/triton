@@ -80,6 +80,34 @@ def test_device_assert_barrier(device):
     assert result.exc is None, result.exc
 
 
+def _run_unsigned_range_iteration_limit(upper, expected, device):
+    triton.knobs.refresh_knobs()
+    out = torch.zeros([1], dtype=torch.int64, device=device)
+
+    @triton.jit
+    def _kernel(lower_ptr, upper_ptr, out_ptr):
+        count = tl.full((), 0, tl.int64)
+        for _ in range(tl.load(lower_ptr), tl.load(upper_ptr)):
+            count += 1
+        tl.store(out_ptr, count)
+
+    lower = torch.tensor([0], dtype=torch.uint64, device=device)
+    upper = torch.tensor([upper], dtype=torch.int64, device=device).view(torch.uint64)
+    _kernel[(1, )](lower, upper, out)
+    getattr(torch, device).synchronize()
+    assert out.item() == expected
+
+
+@pytest.mark.parametrize("upper", [5, 2**64 - 1])
+def test_unsigned_range_iteration_limit(upper, device):
+    wrapped = upper - 2**64 if upper >= 2**63 else upper
+    result = run_in_process(_run_unsigned_range_iteration_limit, (wrapped, upper, device), env={"TRITON_DEBUG": "1"})
+    if upper >= 2**63:
+        assert isinstance(result.exc, RuntimeError)
+    else:
+        assert result.exc is None, result.exc
+
+
 @pytest.mark.parametrize("cond", [False, True])
 def test_static_assert(cond):
 
